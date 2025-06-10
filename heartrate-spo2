@@ -1,0 +1,226 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+// MAX30102 Sensor
+MAX30105 particleSensor;
+
+// I2C Pins for ESP32-C3
+#define SDA_PIN 9
+#define SCL_PIN 8
+
+// Define buffer size for SpO2 calculation
+#define BUFFER_LENGTH 100
+
+// WiFi credentials
+const char* ssid = "A_LITE UGANDA LTD";
+const char* password = "@l!te@2025";
+
+// Device serial and API endpoints
+const char* device_serial = "as-0515-99";
+const char* device_base_url = "https://autothermo.neosaveuganda.com/api/device/";
+const char* assignment_base_url = "https://autothermo.neosaveuganda.com/api/assignment/";
+
+// Device state
+String device_id = "";
+String device_assignment_id = "";
+String patient_id = "";
+String bed_no = "";
+String hospital_id = "";
+
+// Monitoring flag
+bool assignmentSuccess = false;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(I2C_SPEED_STANDARD);
+
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+
+  checkDeviceStatus();
+
+  Serial.println("Initializing MAX30102...");
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found. Check wiring.");
+    while (1);
+  }
+
+  particleSensor.setup(60, 4, 2, 100, 411, 4096);
+  particleSensor.setPulseAmplitudeRed(0x3F);
+  particleSensor.setPulseAmplitudeIR(0x3F);
+  particleSensor.setPulseAmplitudeGreen(0);
+  Serial.println("MAX30102 Initialized.");
+  delay(1000);
+}
+
+void loop() {
+  float heartRate = 0;
+  float spo2 = 0;
+
+  measureVitals(heartRate, spo2);
+
+  Serial.print("\u2764\uFE0F Heart Rate (BPM): ");
+  Serial.println(heartRate);
+  Serial.print("SpO2 (%): ");
+  Serial.println(spo2);
+
+  if (assignmentSuccess && device_assignment_id != "") {
+    sendMonitoringData(spo2, heartRate); // Temperature removed
+  } else {
+    checkDeviceStatus();
+  }
+
+  delay(5000);
+}
+
+void measureVitals(float &heartRate, float &spo2) {
+  uint32_t irBuffer[BUFFER_LENGTH];
+  uint32_t redBuffer[BUFFER_LENGTH];
+  int collected = 0;
+  unsigned long start = millis();
+
+  Serial.println("Collecting IR/RED samples...");
+
+  while (collected < BUFFER_LENGTH && millis() - start < 10000) {
+    particleSensor.check();
+    if (particleSensor.available()) {
+      uint32_t ir = particleSensor.getIR();
+      uint32_t red = particleSensor.getRed();
+
+      if (ir > 10000 && red > 10000) {
+        irBuffer[collected] = ir;
+        redBuffer[collected] = red;
+        collected++;
+        if (collected % 10 == 0) Serial.print(".");
+      }
+      particleSensor.nextSample();
+    }
+    delay(5);
+  }
+
+  if (collected < BUFFER_LENGTH) {
+    Serial.println("Not enough samples collected.");
+    heartRate = 0;
+    spo2 = 0;
+    return;
+  }
+
+  Serial.println("Samples collected. Calculating vitals...");
+
+  int32_t hr, oxygen;
+  int8_t validHR, validSpO2;
+
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, BUFFER_LENGTH, redBuffer, &oxygen, &validSpO2, &hr, &validHR);
+
+  if (validHR && validSpO2 && hr > 30 && hr < 200 && oxygen > 70 && oxygen <= 100) {
+    heartRate = hr;
+    spo2 = oxygen;
+  } else {
+    Serial.println("Invalid HR or SpO2.");
+    heartRate = 0;
+    spo2 = 0;
+  }
+}
+
+void checkDeviceStatus() {
+  if ((WiFi.status() == WL_CONNECTED)) {
+    HTTPClient http;
+    String url = String(device_base_url) + device_serial;
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.println("🗅️ Device API Response: " + payload);
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload);
+
+      if (doc.containsKey("devicestatus") && doc["devicestatus"].containsKey("device_id")) {
+        device_id = doc["devicestatus"]["device_id"].as<String>();
+        checkAssignment();
+      } else {
+        Serial.println("🚫 Failed to fetch valid device ID.");
+      }
+    } else {
+      Serial.println("🚫 Failed to connect to device API.");
+    }
+    http.end();
+  }
+}
+
+void checkAssignment() {
+  if ((WiFi.status() == WL_CONNECTED)) {
+    HTTPClient http;
+    String url = String(assignment_base_url) + device_id;
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.println("🗅️ Assignment API Response: " + payload);
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      if (doc.containsKey("results")) {
+        JsonObject result = doc["results"];
+        device_assignment_id = result["device_assignment_id"].as<String>();
+        patient_id = result["patient_id"].as<String>();
+        bed_no = result["bed_no"].as<String>();
+        hospital_id = result["hospital_id"].as<String>();
+
+        assignmentSuccess = device_assignment_id != "" && device_assignment_id != "null";
+      } else {
+        assignmentSuccess = false;
+      }
+    } else {
+      assignmentSuccess = false;
+      device_assignment_id = "";
+      patient_id = "";
+      bed_no = "";
+      hospital_id = "";
+    }
+    http.end();
+  }
+}
+
+void sendMonitoringData(float spo2, float heart_rate) {
+  if ((WiFi.status() == WL_CONNECTED) && patient_id != "" && hospital_id != "" && device_id != "") {
+    HTTPClient http;
+    String url = "https://autothermo.neosaveuganda.com/api/monitoring/";
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "hospital_id=" + hospital_id +
+                      "&patient_id=" + patient_id +
+                      "&device_id=" + device_id +
+                      "&spo2=" + String(spo2) +
+                      "&heart_rate=" + String(heart_rate);
+
+    Serial.println("🌐 Sending POST request to: " + url);
+    Serial.println("POST data: " + postData);
+
+    int httpResponseCode = http.POST(postData);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("📡 Data sent successfully. Server response: " + response);
+    } else {
+      Serial.println("⚠️ Error sending data. HTTP Code: " + String(httpResponseCode));
+    }
+
+    http.end();
+  } else {
+    Serial.println("🚫 Missing required IDs. Not sending monitoring data.");
+  }
+}
