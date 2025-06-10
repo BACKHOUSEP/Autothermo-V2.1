@@ -1,5 +1,6 @@
 # Autothermo-V2.1
 Overview
+
 This code sketch runs on an ESP32 device connected to an MTS4Z temperature sensor via I2C and manages:
 
 Reading temperature data from the sensor with smoothing and calibration,
